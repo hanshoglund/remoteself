@@ -1,11 +1,11 @@
-{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, ConstraintKinds #-}
+{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, ConstraintKinds, OverloadedStrings #-}
 
 module Main where
 
-import Lib
+import Prelude hiding (putStrLn)
 import System.Process
 import Control.Exception
-import System.IO
+import System.IO hiding (hGetLine, putStrLn, hPutStrLn)
 import Control.Concurrent.Async
 import Control.Applicative
 import Data.Void
@@ -13,24 +13,37 @@ import System.Posix.Process (getProcessID)
 import System.Exit
 import Data.Aeson
 import Control.Monad
+import Data.ByteString (ByteString)
+import Data.ByteString.Char8 (hGetLine, putStrLn, hPutStrLn)
+import qualified Data.ByteString.Lazy as LBS
+import Control.Concurrent.STM
+import Control.Concurrent.STM.TChan
+import Control.Concurrent
 
 getCurrentProcessPath :: IO FilePath
 getCurrentProcessPath = do
   pid <- getProcessID
   -- TODO read /proc/$PID/exe
-  pure "/Users/Hoglund/Code/hs/hsremote/.stack-work/dist/x86_64-osx/Cabal-1.18.1.5/build/hsremote-exe/hsremote-ex"
+  pure "/Users/Hoglund/Code/hs/hsremote/.stack-work/dist/x86_64-osx/Cabal-1.18.1.5/build/hsremote-exe/hsremote-exe"
 
 main :: IO ()
 main = listenSelf echo
 
-
-
+test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send done -> withAsync (forever $ do { v <- recv ; print v }) $ \_ -> do
+  -- threadDelay 2000000
+  forever $ do
+    send $ v "foo"
+    threadDelay 20000
+  where
+    v x = object [("value", String x)]
+echo :: Monad m => m t -> (t -> m a) -> m b
 echo inp out = forever $ do
   msg <- inp
   out msg
 
 listenSelf :: (IO Value -> (Value -> IO ()) -> IO ()) -> IO ()
-listenSelf = undefined
+listenSelf k =
+  k (recvValue stdin) (sendValue stdout)
 -- FIXME proper incremental JSON parsing
 
 type Username  = String
@@ -47,12 +60,21 @@ withSelfRemote
   -> IO r
 withSelfRemote (_,_,_,args) k = do
   exePath <- getCurrentProcessPath
+  print ("FIXME", exePath)
   -- TODO actually transfer + run remotely via SSH
   --  scp exePath root@localhost:tmpPath
   --  ssh root@localhost -p 32768 "tmpPath args..."
   -- Test locally:
   withProcessJSON (proc exePath args) k
 
+-- TODO only works for Object, not Value!
+sendValue :: Handle -> Value -> IO ()
+sendValue handle v = do
+  (hPutStrLn handle . LBS.toStrict . encode) v
+  hFlush handle
+
+recvValue :: Handle -> IO Value
+recvValue handle = (maybe (error "bad bs") id . decode . LBS.fromStrict <$> hGetLine handle)
 
 -- |
 -- Run an action alongside an external process
@@ -63,9 +85,21 @@ withProcessJSON
   :: CreateProcess
   -> (IO Value -> (Value -> IO ()) -> Async ExitCode -> IO r)
   -> IO r
-withProcessJSON = undefined
--- TODO use a (bracket ...MVar) lock here to make read/writes thread-safe
+withProcessJSON pd k = do
+  inChan <- newTChanIO
+  outChan <- newTChanIO
+  let getInput = atomically $ readTChan inChan
+  let putInput x = atomically $ writeTChan inChan x
+  let getOutput = atomically $ readTChan outChan
+  let putOutput x = atomically $ writeTChan outChan x
+  withProcessPipes pd
+            (\inh -> forever $ do { v <- getOutput ; sendValue inh v })
+            (\outh -> forever $ do { v <- recvValue outh; putInput v } )
+            (const blockForever)
+            (k getInput putOutput)
 -- FIXME proper incremental JSON parsing
+  where
+    blockForever = forever $ threadDelay 1000 -- maxBound
 
 withProcessPipes
   :: CreateProcess
