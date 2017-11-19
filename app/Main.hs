@@ -19,6 +19,7 @@ import qualified Data.ByteString.Lazy as LBS
 import Control.Concurrent.STM
 import Control.Concurrent.STM.TChan
 import Control.Concurrent
+import Data.HashMap.Lazy (fromList)
 
 getCurrentProcessPath :: IO FilePath
 getCurrentProcessPath = do
@@ -31,19 +32,20 @@ main = listenSelf echo
 
 test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send done -> withAsync (forever $ do { v <- recv ; print v }) $ \_ -> do
   -- threadDelay 2000000
+  send $ v "first"
   forever $ do
     send $ v "foo"
     threadDelay 20000
   where
-    v x = object [("value", String x)]
+    v x = fromList [("value", String x)]
 echo :: Monad m => m t -> (t -> m a) -> m b
 echo inp out = forever $ do
   msg <- inp
   out msg
 
-listenSelf :: (IO Value -> (Value -> IO ()) -> IO ()) -> IO ()
+listenSelf :: (IO Object -> (Object -> IO ()) -> IO ()) -> IO ()
 listenSelf k =
-  k (recvValue stdin) (sendValue stdout)
+  k (recvObject stdin) (sendObject stdout)
 -- FIXME proper incremental JSON parsing
 
 type Username  = String
@@ -56,7 +58,7 @@ type Arguments = [String]
 withSelfRemote
   :: (Username, Hostname, Port, Arguments)
     -- ^ Where to run + argument strings (so we can dispatch to selfListen)
-  -> (IO Value -> (Value -> IO ()) -> Async ExitCode -> IO r)
+  -> (IO Object -> (Object -> IO ()) -> Async ExitCode -> IO r)
   -> IO r
 withSelfRemote (_,_,_,args) k = do
   exePath <- getCurrentProcessPath
@@ -68,13 +70,13 @@ withSelfRemote (_,_,_,args) k = do
   withProcessJSON (proc exePath args) k
 
 -- TODO only works for Object, not Value!
-sendValue :: Handle -> Value -> IO ()
-sendValue handle v = do
+sendObject :: Handle -> Object -> IO ()
+sendObject handle v = do
   (hPutStrLn handle . LBS.toStrict . encode) v
   hFlush handle
 
-recvValue :: Handle -> IO Value
-recvValue handle = (maybe (error "bad bs") id . decode . LBS.fromStrict <$> hGetLine handle)
+recvObject :: Handle -> IO Object
+recvObject handle = (maybe (error "bad bs") id . decode . LBS.fromStrict <$> hGetLine handle)
 
 -- |
 -- Run an action alongside an external process
@@ -83,7 +85,7 @@ recvValue handle = (maybe (error "bad bs") id . decode . LBS.fromStrict <$> hGet
 -- to its stdin.
 withProcessJSON
   :: CreateProcess
-  -> (IO Value -> (Value -> IO ()) -> Async ExitCode -> IO r)
+  -> (IO Object -> (Object -> IO ()) -> Async ExitCode -> IO r)
   -> IO r
 withProcessJSON pd k = do
   inChan <- newTChanIO
@@ -93,8 +95,8 @@ withProcessJSON pd k = do
   let getOutput = atomically $ readTChan outChan
   let putOutput x = atomically $ writeTChan outChan x
   withProcessPipes pd
-            (\inh -> forever $ do { v <- getOutput ; sendValue inh v })
-            (\outh -> forever $ do { v <- recvValue outh; putInput v } )
+            (\inh -> forever $ do { v <- getOutput ; sendObject inh v })
+            (\outh -> forever $ do { v <- recvObject outh; putInput v } )
             (const blockForever)
             (k getInput putOutput)
 -- FIXME proper incremental JSON parsing
