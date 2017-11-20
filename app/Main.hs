@@ -1,4 +1,4 @@
-{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, ConstraintKinds, OverloadedStrings #-}
+{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, DeriveGeneric, ConstraintKinds, OverloadedStrings, RankNTypes, ScopedTypeVariables #-}
 
 module Main where
 
@@ -20,6 +20,10 @@ import Control.Concurrent.STM
 import Control.Concurrent.STM.TChan
 import Control.Concurrent
 import Data.HashMap.Lazy (fromList)
+import GHC.Generics
+import Data.Text (Text)
+import qualified System.Directory as Directory
+import Data.Traversable
 
 getCurrentProcessPath :: IO FilePath
 getCurrentProcessPath = do
@@ -29,6 +33,105 @@ getCurrentProcessPath = do
 
 main :: IO ()
 main = listenSelf echo
+
+
+data Cmd
+  :: * -- Sent by client before run
+  -> * -- Sent by client during run
+  -> * -- Sent by server during run
+  -> * -- Sent by server after run
+  -> *
+  where
+    Id    :: Cmd Int () () Int
+    Ls    :: Cmd FilePath () () [FilePath]
+    Accum :: Cmd Int String String ()
+    -- Id   :: {-JSON a =>-} Cmd a () () a
+    -- Echo :: {-JSON a =>-} Cmd () a a ()
+
+unrefCmd :: Cmd x y z o -> Text
+unrefCmd Id   = "id"
+unrefCmd Ls   = "ls"
+unrefCmd Accum = "accum"
+-- unrefCmd Echo = "echo"
+
+refCmd :: Text -> (forall x y z o . Cmd x y z o -> m r) -> m r
+refCmd "id" k = k Id
+refCmd "ls" k = k Ls
+refCmd "accum" k = k Accum
+refCmd _ k = error "bad cmd"
+
+refInit :: JSON a => cmd a i o b -> Value -> a
+refInit _ = unsafeFromRes . fromJSON
+
+refIn :: JSON i => cmd a i o b -> Value -> i
+refIn _ = unsafeFromRes . fromJSON
+
+unrefOut :: JSON o => cmd a i o b -> o -> Value
+unrefOut _ = toJSON
+
+unrefRes :: JSON b => cmd a i o b -> b -> Value
+unrefRes _ = toJSON
+
+-- instance ToJSON (Cmd a i o b) where
+--   toJSON x = go x
+--     where
+--       go Id = String "Id"
+--       go Echo = String "Echo"
+-- instance FromJSON (Cmd a i o b) where
+--   parseJSON (String x) = go x
+--     where
+--       go "Id" = Id
+--       go "Echo" = Echo
+--       go _ = bad
+--       bad = error "bad FromJSON Cmd"
+--   parseJSON _ = bad
+--     where
+--       bad = error "bad FromJSON Cmd"
+-- Protocol:
+--    Client sends {id:String, cmd:String, init:a}, then a sequence of {id:String,val:i}
+--    Server/probe responds with {id:String,val:o} and finally with {id:String,done:b} or {id:String,fatal:String}
+
+data Msg where
+  Init  :: Text -> Text -> Value -> Msg -- Client/initiator sends {id:String, cmd:String, init:a}
+  In    :: Text -> Value -> Msg           -- Client/initiator sends a sequence of {id:String,val:i}
+  Out   :: Text -> Value -> Msg           -- Server/probe responds with {id:String,val:o}
+  Done  :: Text -> Value -> Msg           -- Server completed  {id:String,done:b}
+  Fatal :: Text -> Text -> Msg          -- Server crashed  {id:String,done:b}
+  deriving (Generic)
+instance ToJSON Msg
+instance FromJSON Msg
+msgToObject :: Msg -> Object
+msgToObject m = case toJSON m of
+  Object o -> o
+  _ -> error "bad obj"
+
+listenSelfTyped :: IO ()
+listenSelfTyped = listenSelf $ \recv send -> do
+  -- TODO thanks to the reqId field we could allow several requests in parallel: for now run all in sequence
+  Init reqId cmdId initVal <- unsafeFromRes . fromJSON . Object <$> recv
+  -- TODO catch fatal exceptions...
+  -- TODO break out impl functions so that it's not breakable...
+  -- e.g. pass refInit/refIn/unrefOut/unrefRes
+  refCmd cmdId $ \cmd -> case cmd of
+    Id -> do
+      let val = refInit cmd initVal
+      send $ msgToObject $ Done reqId (unrefRes cmd val)
+    Ls -> do
+      let path = refInit cmd initVal
+      res <- Directory.getDirectoryContents path
+      send $ msgToObject $ Done reqId (unrefRes cmd res)
+    Accum -> do
+      -- _ <- cmdImpl (refInit cmd initVal)
+      let n = refInit cmd initVal
+      replicateM n $ do
+        In reqId val <- unsafeFromRes . fromJSON . Object <$> recv
+        let m = refIn cmd val
+        send $ msgToObject $ Out reqId (unrefOut cmd $ m ++ "foo")
+      send $ msgToObject $ Done reqId (unrefRes cmd ())
+
+unsafeFromRes :: Result a -> a
+unsafeFromRes (Success x) = x
+unsafeFromRes _ = error "bad res"
 
 test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send done -> withAsync (forever $ do { v <- recv ; print v }) $ \_ -> do
   -- threadDelay 2000000
@@ -153,8 +256,8 @@ data Stream r a = Stream (Future (Either r (a, Stream r a)))
 -- type CommandInterp f a i o b = a -> Stream Void i -> f (Stream b o)
 --
 -- -- In place of static pointers, we can just provide a fixed set (including some combinators) and an interpreter function
-data Prim :: * -> * -> * -> * -> * where
-  Ls    :: Prim FilePath Void Void [FilePath]
+-- data Prim :: * -> * -> * -> * -> * where
+  -- Ls    :: Prim FilePath Void Void [FilePath]
 --   Mkdir :: PrimCommand FilePath Void Void Bool
 -- -- Combinators, interpreted sender side (we could possibly do some of them client-side in theory, but not necessary here)
 -- data Command prim where
