@@ -34,6 +34,7 @@ getCurrentProcessPath = do
 main :: IO ()
 main = listenSelf echo
 
+contramap f g = g . f
 
 data Cmd
   :: * -- Sent by client before run
@@ -48,13 +49,23 @@ data Cmd
     -- Id   :: {-JSON a =>-} Cmd a () () a
     -- Echo :: {-JSON a =>-} Cmd () a a ()
 
+impl :: Cmd a i o b -> a -> IO i -> (o -> IO ()) -> IO b
+impl Id x _ _ = pure x
+impl Ls path _ _ =
+  Directory.getDirectoryContents path
+impl Accum n re se = do
+  replicateM n $ do
+    m <- re
+    se (m ++ "foo")
+  pure ()
+
 unrefCmd :: Cmd x y z o -> Text
 unrefCmd Id   = "id"
 unrefCmd Ls   = "ls"
 unrefCmd Accum = "accum"
 -- unrefCmd Echo = "echo"
 
-refCmd :: Text -> (forall x y z o . Cmd x y z o -> m r) -> m r
+refCmd :: Text -> (forall x y z o . (JSON x, JSON y, JSON z, JSON o) => Cmd x y z o -> r) -> r
 refCmd "id" k = k Id
 refCmd "ls" k = k Ls
 refCmd "accum" k = k Accum
@@ -91,6 +102,7 @@ unrefRes _ = toJSON
 --    Client sends {id:String, cmd:String, init:a}, then a sequence of {id:String,val:i}
 --    Server/probe responds with {id:String,val:o} and finally with {id:String,done:b} or {id:String,fatal:String}
 
+
 data Msg where
   Init  :: Text -> Text -> Value -> Msg -- Client/initiator sends {id:String, cmd:String, init:a}
   In    :: Text -> Value -> Msg           -- Client/initiator sends a sequence of {id:String,val:i}
@@ -109,29 +121,26 @@ listenSelfTyped :: IO ()
 listenSelfTyped = listenSelf $ \recv send -> do
   -- TODO thanks to the reqId field we could allow several requests in parallel: for now run all in sequence
   Init reqId cmdId initVal <- unsafeFromRes . fromJSON . Object <$> recv
+  let recvIn = do { In reqId val <- unsafeFromRes . fromJSON . Object <$> recv ; pure val }
+  let sendOut = (send . msgToObject . Out reqId)
+  let sendDone = (send . msgToObject . Done reqId)
   -- TODO catch fatal exceptions...
   -- TODO break out impl functions so that it's not breakable...
   -- e.g. pass refInit/refIn/unrefOut/unrefRes
-  refCmd cmdId $ \cmd -> case cmd of
-    Id -> do
-      let val = refInit cmd initVal
-      send $ msgToObject $ Done reqId (unrefRes cmd val)
-    Ls -> do
-      let path = refInit cmd initVal
-      res <- Directory.getDirectoryContents path
-      send $ msgToObject $ Done reqId (unrefRes cmd res)
-    Accum -> do
-      -- _ <- cmdImpl (refInit cmd initVal)
-      let n = refInit cmd initVal
-      replicateM n $ do
-        In reqId val <- unsafeFromRes . fromJSON . Object <$> recv
-        let m = refIn cmd val
-        send $ msgToObject $ Out reqId (unrefOut cmd $ m ++ "foo")
-      send $ msgToObject $ Done reqId (unrefRes cmd ())
+  refCmd cmdId $ \cmd -> do
+      let initVal_  = refInit cmd initVal
+      let recvIn_   = refIn cmd <$> recvIn
+      let sendOut_  = contramap (unrefOut cmd) sendOut
+      let sendDone_ = contramap (unrefRes cmd) sendDone
+      res <- impl cmd initVal_ recvIn_ sendOut_
+      sendDone_ res
 
 unsafeFromRes :: Result a -> a
 unsafeFromRes (Success x) = x
 unsafeFromRes _ = error "bad res"
+
+
+
 
 test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send done -> withAsync (forever $ do { v <- recv ; print v }) $ \_ -> do
   -- threadDelay 2000000
@@ -141,6 +150,9 @@ test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send d
     threadDelay 20000
   where
     v x = fromList [("value", String x)]
+
+
+
 echo :: Monad m => m t -> (t -> m a) -> m b
 echo inp out = forever $ do
   msg <- inp
@@ -155,8 +167,20 @@ type Username  = String
 type Hostname  = String
 type Port      = String
 type Arguments = [String]
+type TypeRepStr = String
 
--- | Transfer the current process to a remote server via SSH and invoke it there.
+-- | Transfer the current executable to a remote server via SSH and invoke the given command.
+--   NOTE: The main function of the current executable *must* handle the specific argument string given to this function by to invoking 'listenSelfTyped'.
+withSelfRemoteTyped
+  :: (Username, Hostname, Port, Arguments)
+  -> Cmd a i o b
+  -> a
+  -> (IO o -> (i -> IO ()) -> Async (Either (Maybe (TypeRepStr, String), ExitCode) b) -> IO r)
+  -> IO r
+withSelfRemoteTyped = undefined
+
+
+-- | Transfer the current executable to a remote server via SSH and invoke it there.
 --   The main of the current process must dispatch the arguments given to withSelfRemote to invoke listenSelf for this to work.
 withSelfRemote
   :: (Username, Hostname, Port, Arguments)
