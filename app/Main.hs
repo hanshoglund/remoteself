@@ -1,5 +1,9 @@
-{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, DeriveGeneric, ConstraintKinds, OverloadedStrings, RankNTypes, ScopedTypeVariables #-}
+{-# LANGUAGE KindSignatures, GADTs, DeriveFunctor, DeriveGeneric, ConstraintKinds, OverloadedStrings, RankNTypes, ScopedTypeVariables, TupleSections #-}
 
+-- | Run arbitrary operations on a remote machine by starting a copy of the current executable.
+--   The copy communicates with the original via a type-safe transport (using SSH pipes), a la Ansible.
+--   Separate types can be provided for parameters, result and bidirectional streams.
+-- Util.RemoteCommand
 module Main where
 
 import Prelude hiding (putStrLn)
@@ -32,15 +36,15 @@ getCurrentProcessPath = do
   pure "/Users/Hoglund/Code/hs/hsremote/.stack-work/dist/x86_64-osx/Cabal-1.18.1.5/build/hsremote-exe/hsremote-exe"
 
 main :: IO ()
-main = listenSelf echo
+main = listenSelfTyped
 
 contramap f g = g . f
 
 data Cmd
-  :: * -- Sent by client before run
-  -> * -- Sent by client during run
-  -> * -- Sent by server during run
-  -> * -- Sent by server after run
+  :: * -- Parameters
+  -> * -- Input stream
+  -> * -- Output stream
+  -> * -- Result
   -> *
   where
     Id    :: Cmd Int () () Int
@@ -48,6 +52,15 @@ data Cmd
     Accum :: Cmd Int String String ()
     -- Id   :: {-JSON a =>-} Cmd a () () a
     -- Echo :: {-JSON a =>-} Cmd () a a ()
+
+-- class IsCommand cmd where
+--   impl_ :: cmd a i o b -> a -> IO i -> (o -> IO ()) -> IO b
+--   unrefCmd_ :: cmd x y z o -> Text
+--   refCmd_ :: Text -> (forall x y z o . (JSON x, JSON y, JSON z, JSON o) => cmd x y z o -> r) -> r
+-- instance IsCommand Cmd where
+--   impl_ = impl
+--   unrefCmd_ = unrefCmd
+--   refCmd_ = refCmd
 
 impl :: Cmd a i o b -> a -> IO i -> (o -> IO ()) -> IO b
 impl Id x _ _ = pure x
@@ -74,11 +87,23 @@ refCmd _ k = error "bad cmd"
 refInit :: JSON a => cmd a i o b -> Value -> a
 refInit _ = unsafeFromRes . fromJSON
 
+unrefInit :: JSON a => cmd a i o b -> a -> Value
+unrefInit _ = toJSON
+
 refIn :: JSON i => cmd a i o b -> Value -> i
 refIn _ = unsafeFromRes . fromJSON
 
+unrefIn :: JSON i => cmd a i o b -> i -> Value
+unrefIn _ = toJSON
+
+refOut :: JSON o => cmd a i o b -> Value -> o
+refOut _ = unsafeFromRes . fromJSON
+
 unrefOut :: JSON o => cmd a i o b -> o -> Value
 unrefOut _ = toJSON
+
+refRes :: JSON b => cmd a i o b -> Value -> b
+refRes _ = unsafeFromRes . fromJSON
 
 unrefRes :: JSON b => cmd a i o b -> b -> Value
 unrefRes _ = toJSON
@@ -108,7 +133,7 @@ data Msg where
   In    :: Text -> Value -> Msg           -- Client/initiator sends a sequence of {id:String,val:i}
   Out   :: Text -> Value -> Msg           -- Server/probe responds with {id:String,val:o}
   Done  :: Text -> Value -> Msg           -- Server completed  {id:String,done:b}
-  Fatal :: Text -> Text -> Msg          -- Server crashed  {id:String,done:b}
+  Fatal :: Text -> String -> Msg          -- Server crashed  {id:String,done:b}
   deriving (Generic)
 instance ToJSON Msg
 instance FromJSON Msg
@@ -124,23 +149,30 @@ listenSelfTyped = listenSelf $ \recv send -> do
   let recvIn = do { In reqId val <- unsafeFromRes . fromJSON . Object <$> recv ; pure val }
   let sendOut = (send . msgToObject . Out reqId)
   let sendDone = (send . msgToObject . Done reqId)
-  -- TODO catch fatal exceptions...
+  let sendFatal = (send . msgToObject . Fatal reqId)
   -- TODO break out impl functions so that it's not breakable...
   -- e.g. pass refInit/refIn/unrefOut/unrefRes
+  -- FIXME also catch errors in refCmd
   refCmd cmdId $ \cmd -> do
       let initVal_  = refInit cmd initVal
       let recvIn_   = refIn cmd <$> recvIn
       let sendOut_  = contramap (unrefOut cmd) sendOut
       let sendDone_ = contramap (unrefRes cmd) sendDone
-      res <- impl cmd initVal_ recvIn_ sendOut_
-      sendDone_ res
+      res <- try $ impl cmd initVal_ recvIn_ sendOut_
+      case res of
+        Left (e :: SomeException) -> sendFatal (show e)
+        Right res -> sendDone_ res
 
 unsafeFromRes :: Result a -> a
 unsafeFromRes (Success x) = x
 unsafeFromRes _ = error "bad res"
 
+unsafeFromObj (Object x) = x
+unsafeFromObj _ = error "bad obj"
 
 
+test2 = do
+  withSelfRemoteTyped ("hans", "localhost", "22", ["selfremote"]) Ls "/Users/Hoglund/Desktop" $ \recv send res -> threadDelay 2000000 >> wait res
 
 test = withSelfRemote ("hans", "localhost", "22", ["selfremote"]) $ \recv send done -> withAsync (forever $ do { v <- recv ; print v }) $ \_ -> do
   -- threadDelay 2000000
@@ -161,7 +193,6 @@ echo inp out = forever $ do
 listenSelf :: (IO Object -> (Object -> IO ()) -> IO ()) -> IO ()
 listenSelf k =
   k (recvObject stdin) (sendObject stdout)
--- FIXME proper incremental JSON parsing
 
 type Username  = String
 type Hostname  = String
@@ -172,12 +203,24 @@ type TypeRepStr = String
 -- | Transfer the current executable to a remote server via SSH and invoke the given command.
 --   NOTE: The main function of the current executable *must* handle the specific argument string given to this function by to invoking 'listenSelfTyped'.
 withSelfRemoteTyped
-  :: (Username, Hostname, Port, Arguments)
+  :: (JSON a, JSON i, JSON o, JSON b)
+  => (Username, Hostname, Port, Arguments)
   -> Cmd a i o b
   -> a
   -> (IO o -> (i -> IO ()) -> Async (Either (Maybe (TypeRepStr, String), ExitCode) b) -> IO r)
   -> IO r
-withSelfRemoteTyped = undefined
+withSelfRemoteTyped conn cmd init k = withSelfRemote conn $ \recv send done -> do
+  let reqId = "dummy"
+  send $ msgToObject $ Init reqId (unrefCmd cmd) (unrefInit cmd init)
+  withAsync (forever $ recv >>= print) $ \_ ->
+    k
+      -- FIXME parse Out/Done/Fatal
+      (refOut cmd <$> do { Out reqId val <- unsafeFromRes . fromJSON . Object <$> recv ; pure val })
+
+      (contramap (msgToObject . In reqId . unrefIn cmd) send)
+
+      -- FIXME also objserver return value etc.. (maybe change return type too...), see above
+      (Left . (Nothing, ) <$> done)
 
 
 -- | Transfer the current executable to a remote server via SSH and invoke it there.
@@ -196,7 +239,7 @@ withSelfRemote (_,_,_,args) k = do
   -- Test locally:
   withProcessJSON (proc exePath args) k
 
--- TODO only works for Object, not Value!
+-- FIXME proper incremental JSON parsing instead of hGetLine, hPutStrLn
 sendObject :: Handle -> Object -> IO ()
 sendObject handle v = do
   (hPutStrLn handle . LBS.toStrict . encode) v
@@ -226,7 +269,6 @@ withProcessJSON pd k = do
             (\outh -> forever $ do { v <- recvObject outh; putInput v } )
             (const blockForever)
             (k getInput putOutput)
--- FIXME proper incremental JSON parsing
   where
     blockForever = forever $ threadDelay 1000 -- maxBound
 
